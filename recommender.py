@@ -56,6 +56,12 @@ def get_model_metadata() -> Dict[str, Any]:
     }
 
 
+def format_poster(path: Any) -> str:
+    if isinstance(path, str) and path.startswith("/"):
+        return f"https://image.tmdb.org/t/p/w500{path}"
+    return path if isinstance(path, str) else ""
+
+
 def recommend_movie(title: str, n: int = 10) -> Optional[Dict[str, Any]]:
     """
     Recommends top n similar movies based on cluster similarity and euclidean distance.
@@ -72,7 +78,9 @@ def recommend_movie(title: str, n: int = 10) -> Optional[Dict[str, Any]]:
     target_title = title.strip().lower()
     movie = df[df["title"].astype(str).str.lower() == target_title]
     if movie.empty:
-        return None
+        movie = df[df["original_title"].astype(str).str.lower() == target_title]
+        if movie.empty:
+            return None
 
     movie_index = movie.index[0]
     movie_features = X[movie_index].reshape(1, -1)
@@ -98,18 +106,13 @@ def recommend_movie(title: str, n: int = 10) -> Optional[Dict[str, Any]]:
     ]
 
     if "poster_path" in rec_df.columns:
-        rec_df["poster_path"] = rec_df["poster_path"].apply(
-            lambda x: f"https://image.tmdb.org/t/p/w500{x}"
-            if isinstance(x, str) and x.startswith("/")
-            else (x if isinstance(x, str) else "")
-        )
+        rec_df["poster_path"] = rec_df["poster_path"].apply(format_poster)
     recommendations = rec_df.fillna("").to_dict(orient="records")
 
     queried_movie = df.loc[movie_index, available_cols].to_dict()
-    if isinstance(queried_movie.get("poster_path"), str) and queried_movie["poster_path"].startswith("/"):
-        queried_movie["poster_path"] = f"https://image.tmdb.org/t/p/w500{queried_movie['poster_path']}"
+    if "poster_path" in queried_movie:
+        queried_movie["poster_path"] = format_poster(queried_movie["poster_path"])
 
-    # Replace any NaN values in queried_movie
     for k, v in queried_movie.items():
         if pd.isna(v):
             queried_movie[k] = ""
@@ -121,24 +124,138 @@ def recommend_movie(title: str, n: int = 10) -> Optional[Dict[str, Any]]:
     }
 
 
-def search_movies(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """Searches for movies by title prefix or substring for autocomplete."""
+def search_movies(query: str, limit: int = 15) -> List[Dict[str, Any]]:
+    """Searches for movies by title substring across all 69,405 titles in the dataset."""
     bundle = load_model_bundle()
     if bundle is None:
         return []
     df = bundle["df"]
     q = query.strip().lower()
-    matches = df[df["title"].astype(str).str.lower().str.contains(q, regex=False, na=False)].head(limit)
-    cols = ["id", "title", "release_year", "poster_path", "vote_average"]
+    matches = df[df["title"].astype(str).str.lower().str.contains(q, regex=False, na=False)].sort_values(
+        by=["popularity", "vote_average"], ascending=[False, False]
+    ).head(limit)
+    cols = [
+        "id", "title", "original_title", "overview", "release_year",
+        "poster_path", "vote_average", "genres", "runtime", "popularity", "original_language"
+    ]
     available_cols = [c for c in cols if c in df.columns]
     results = matches[available_cols].copy()
     if "poster_path" in results.columns:
-        results["poster_path"] = results["poster_path"].apply(
-            lambda x: f"https://image.tmdb.org/t/p/w500{x}"
-            if isinstance(x, str) and x.startswith("/")
-            else (x if isinstance(x, str) else "")
-        )
+        results["poster_path"] = results["poster_path"].apply(format_poster)
     return results.fillna("").to_dict(orient="records")
+
+
+def get_movie_by_id(movie_id: Any) -> Optional[Dict[str, Any]]:
+    """Fetches complete movie details for a specific ID from the 69,405 dataset."""
+    bundle = load_model_bundle()
+    if bundle is None:
+        return None
+    df = bundle["df"]
+    try:
+        mid = int(movie_id)
+        match = df[df["id"] == mid]
+    except (ValueError, TypeError):
+        match = df[df["id"].astype(str) == str(movie_id)]
+    
+    if match.empty:
+        return None
+    
+    cols = [
+        "id", "title", "original_title", "overview", "poster_path",
+        "release_date", "release_year", "vote_average", "vote_count",
+        "runtime", "genres", "original_language", "popularity", "budget", "revenue", "cluster"
+    ]
+    available_cols = [c for c in cols if c in df.columns]
+    row = match.iloc[0][available_cols].to_dict()
+    if "poster_path" in row:
+        row["poster_path"] = format_poster(row["poster_path"])
+    
+    clean = {}
+    for k, v in row.items():
+        clean[k] = "" if pd.isna(v) else v
+    return clean
+
+
+def get_movies(
+    page: int = 1,
+    limit: int = 24,
+    genre: Optional[str] = None,
+    sort_by: str = "popularity",
+    search: Optional[str] = None,
+    min_rating: float = 0.0,
+    language: Optional[str] = None
+) -> Dict[str, Any]:
+    """Paginated retrieval of movies from the 69,405 dataset with filtering and sorting."""
+    bundle = load_model_bundle()
+    if bundle is None:
+        return {"total": 0, "page": page, "limit": limit, "total_pages": 0, "results": []}
+    
+    df = bundle["df"]
+    filtered = df
+
+    if search:
+        q = search.strip().lower()
+        filtered = filtered[filtered["title"].astype(str).str.lower().str.contains(q, regex=False, na=False)]
+
+    if genre:
+        filtered = filtered[filtered["genres"].astype(str).str.contains(genre.strip(), case=False, regex=False, na=False)]
+
+    if language:
+        filtered = filtered[filtered["original_language"].astype(str).str.lower() == language.strip().lower()]
+
+    if min_rating > 0.0:
+        filtered = filtered[filtered["vote_average"] >= min_rating]
+
+    # Sorting
+    if sort_by == "rating":
+        filtered = filtered.sort_values(by=["vote_average", "vote_count"], ascending=[False, False])
+    elif sort_by in ["newest", "year"]:
+        filtered = filtered.sort_values(by=["release_year", "popularity"], ascending=[False, False])
+    elif sort_by == "oldest":
+        filtered = filtered.sort_values(by=["release_year", "popularity"], ascending=[True, False])
+    elif sort_by == "az":
+        filtered = filtered.sort_values(by="title", ascending=True)
+    else:
+        filtered = filtered.sort_values(by=["popularity", "vote_average"], ascending=[False, False])
+
+    total = len(filtered)
+    total_pages = max(1, (total + limit - 1) // limit)
+    start_idx = max(0, (page - 1) * limit)
+    end_idx = start_idx + limit
+
+    sliced = filtered.iloc[start_idx:end_idx].copy()
+    cols = [
+        "id", "title", "original_title", "overview", "poster_path",
+        "release_date", "release_year", "vote_average", "vote_count",
+        "runtime", "genres", "original_language", "popularity"
+    ]
+    available_cols = [c for c in cols if c in sliced.columns]
+    records = sliced[available_cols].copy()
+    if "poster_path" in records.columns:
+        records["poster_path"] = records["poster_path"].apply(format_poster)
+
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+        "results": records.fillna("").to_dict(orient="records")
+    }
+
+
+def get_genres_summary() -> List[Dict[str, Any]]:
+    """Returns all unique genres and their movie counts from the dataset."""
+    bundle = load_model_bundle()
+    if bundle is None:
+        return []
+    df = bundle["df"]
+    genre_counts = {}
+    for g_str in df["genres"].dropna():
+        for g in str(g_str).split(","):
+            name = g.strip()
+            if name:
+                genre_counts[name] = genre_counts.get(name, 0) + 1
+    return [{"name": k, "count": v} for k, v in sorted(genre_counts.items(), key=lambda x: -x[1])]
 
 
 # Pre-load model on module import for instantaneous endpoint latency
